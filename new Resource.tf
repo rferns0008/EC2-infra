@@ -1,12 +1,13 @@
 # ==========================================
-# 1. PROVIDER & NETWORK
+# 1. PROVIDER & REGION
 # ==========================================
 provider "aws" {
   region = "ap-south-1" 
 }
 
-data "aws_region" "current" {}
-
+# ==========================================
+# 2. NETWORK INFRASTRUCTURE (MANAGEMENT)
+# ==========================================
 resource "aws_vpc" "devops_vpc" {
   cidr_block           = "10.0.0.0/16"
   enable_dns_hostnames = true
@@ -63,6 +64,7 @@ resource "aws_route_table" "private_rt" {
     cidr_block     = "0.0.0.0/0"
     nat_gateway_id = aws_nat_gateway.nat_gw.id
   }
+  tags = { Name = "Mgmt-Private-Route-Table" }
 }
 
 resource "aws_route_table_association" "private_assoc" {
@@ -71,9 +73,9 @@ resource "aws_route_table_association" "private_assoc" {
 }
 
 # ==========================================
-# 2. SECURITY GROUPS (MATCHING STATE)
+# 3. SECURITY & ENDPOINTS
 # ==========================================
-resource "aws_security_group" "eic_sg_new" {
+resource "aws_security_group" "eic_sg" {
   name   = "eic-endpoint-sg"
   vpc_id = aws_vpc.devops_vpc.id
   egress {
@@ -84,7 +86,13 @@ resource "aws_security_group" "eic_sg_new" {
   }
 }
 
-resource "aws_security_group" "internal_sg_new" {
+resource "aws_ec2_instance_connect_endpoint" "eic_endpoint" {
+  subnet_id          = aws_subnet.private.id
+  security_group_ids = [aws_security_group.eic_sg.id]
+  tags               = { Name = "VPC-Tunnel-Endpoint" }
+}
+
+resource "aws_security_group" "internal_sg" {
   name        = "internal-devops-sg"
   description = "Allows all internal traffic between DevOps tools"
   vpc_id      = aws_vpc.devops_vpc.id
@@ -100,7 +108,7 @@ resource "aws_security_group" "internal_sg_new" {
     from_port       = 22
     to_port         = 22
     protocol        = "tcp"
-    security_groups = [aws_security_group.eic_sg_new.id]
+    security_groups = [aws_security_group.eic_sg.id]
   }
 
   egress {
@@ -112,89 +120,30 @@ resource "aws_security_group" "internal_sg_new" {
 }
 
 # ==========================================
-# 3. ENDPOINTS, LOCKS & STORAGE
+# 4. IAM ROLE (MINIMAL ACCESS)
 # ==========================================
-resource "aws_ec2_instance_connect_endpoint" "eic_endpoint" {
-  subnet_id          = aws_subnet.private.id
-  security_group_ids = [aws_security_group.eic_sg_new.id]
-  tags               = { Name = "VPC-Tunnel-Endpoint" }
-}
+resource "aws_iam_role" "jenkins_mgmt_role" {
+  name = "jenkins-management-role"
 
-resource "aws_vpc_endpoint" "s3_endpoint" {
-  vpc_id            = aws_vpc.devops_vpc.id
-  service_name      = "com.amazonaws.${data.aws_region.current.name}.s3"
-  vpc_endpoint_type = "Gateway" 
-  route_table_ids   = [aws_route_table.private_rt.id]
-  tags              = { Name = "Mgmt-S3-VPC-Endpoint" }
-}
-
-resource "aws_dynamodb_table" "terraform_locks" {
-  name         = "terraform-state-lock"
-  billing_mode = "PAY_PER_REQUEST"
-  hash_key     = "LockID"
-
-  attribute {
-    name = "LockID"
-    type = "S"
-  }
-}
-
-resource "aws_s3_bucket" "monitoring_assets" {
-  bucket_prefix = "devops-monitoring-assets-"
-  force_destroy = true
-  tags          = { Name = "Monitoring-Assets-Bucket" }
-}
-
-resource "aws_s3_object" "flask_dashboard" {
-  bucket = aws_s3_bucket.monitoring_assets.id
-  key    = "dashboards/flask_dashboard.json"
-  source = "./9688_rev1.json"
-  etag   = filemd5("./9688_rev1.json")
-}
-
-# ==========================================
-# 4. IAM ROLES (LEAST PRIVILEGE)
-# ==========================================
-resource "aws_iam_role" "jenkins_role" {
-  name               = "jenkins-management-role"
   assume_role_policy = jsonencode({
     Version = "2012-10-17"
-    Statement = [{ Action = "sts:AssumeRole", Effect = "Allow", Principal = { Service = "ec2.amazonaws.com" } }]
+    Statement = [{
+      Action = "sts:AssumeRole"
+      Effect = "Allow"
+      Principal = { Service = "ec2.amazonaws.com" }
+    }]
   })
 }
 
-resource "aws_iam_instance_profile" "jenkins_profile" {
+# No S3, EKS, or ECR policies attached here to maintain total isolation.
+
+resource "aws_iam_instance_profile" "jenkins_mgmt_profile" {
   name = "jenkins-management-profile"
-  role = aws_iam_role.jenkins_role.name
-}
-
-resource "aws_iam_role" "monitoring_role" {
-  name               = "monitoring-management-role"
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{ Action = "sts:AssumeRole", Effect = "Allow", Principal = { Service = "ec2.amazonaws.com" } }]
-  })
-}
-
-resource "aws_iam_instance_profile" "monitoring_profile" {
-  name = "monitoring-management-profile"
-  role = aws_iam_role.monitoring_role.name
-}
-
-resource "aws_iam_role_policy" "monitoring_bootstrap" {
-  name = "monitoring-bootstrap"
-  role = aws_iam_role.monitoring_role.id
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      { Effect = "Allow", Action = ["s3:GetObject"], Resource = ["${aws_s3_bucket.monitoring_assets.arn}/*"] },
-      { Effect = "Allow", Action = ["ec2:DescribeInstances"], Resource = ["*"] }
-    ]
-  })
+  role = aws_iam_role.jenkins_mgmt_role.name
 }
 
 # ==========================================
-# 5. EC2 INSTANCES & USER DATA
+# 5. EC2 INSTANCES
 # ==========================================
 locals {
   devops_setup = <<-EOF
@@ -204,43 +153,15 @@ locals {
                  sudo usermod -aG docker ubuntu
                  sudo chmod 666 /var/run/docker.sock
                  EOF
-
-  grafana_setup = <<-EOF
-    #!/bin/bash
-    sudo apt update
-    sudo apt install -y docker.io unzip awscli jq
-    EKS_IP=$(aws ec2 describe-instances --region ${data.aws_region.current.name} --filters "Name=tag:eks:cluster-name,Values=secure-eks-testing" "Name=instance-state-name,Values=running" --query "Reservations[0].Instances[0].PrivateIpAddress" --output text)
-    if [ -z "$EKS_IP" ] || [ "$EKS_IP" == "None" ]; then EKS_IP="127.0.0.1"; fi
-    sudo mkdir -p /etc/grafana/provisioning/datasources/
-    sudo mkdir -p /etc/grafana/provisioning/dashboards/
-    sudo mkdir -p /var/lib/grafana/dashboards/
-    cat << 'YAML' | sudo tee /etc/grafana/provisioning/datasources/prometheus.yaml
-    apiVersion: 1
-    datasources:
-      - name: Prometheus-EKS
-        type: prometheus
-        url: http://$${EKS_IP}:30271
-        isDefault: true
-    YAML
-    cat << 'YAML' | sudo tee /etc/grafana/provisioning/dashboards/dashboards.yaml
-    apiVersion: 1
-    providers:
-      - name: 'Chatbot-Dashboards'
-        options:
-          path: /var/lib/grafana/dashboards
-    YAML
-    aws s3 cp s3://${aws_s3_bucket.monitoring_assets.id}/dashboards/flask_dashboard.json /var/lib/grafana/dashboards/flask_dashboard.json
-    sudo systemctl restart grafana-server
-  EOF
 }
 
 resource "aws_instance" "jenkins_server" {
   ami                    = "ami-09d76355bd4eecccf" 
   instance_type          = "t3.small"
   subnet_id              = aws_subnet.private.id
-  vpc_security_group_ids = [aws_security_group.internal_sg_new.id]
+  vpc_security_group_ids = [aws_security_group.internal_sg.id]
   key_name               = "promethius-grafana-keypair"
-  iam_instance_profile   = aws_iam_instance_profile.jenkins_profile.name
+  iam_instance_profile   = aws_iam_instance_profile.jenkins_mgmt_profile.name
   user_data              = local.devops_setup
   tags                   = { Name = "Jenkins-Server-Private" }
 }
@@ -250,9 +171,9 @@ resource "aws_instance" "jenkins_agents" {
   ami                    = "ami-05afe695674ad97eb"
   instance_type          = "t3.small"
   subnet_id              = aws_subnet.private.id
-  vpc_security_group_ids = [aws_security_group.internal_sg_new.id]
+  vpc_security_group_ids = [aws_security_group.internal_sg.id]
   key_name               = "promethius-grafana-keypair"
-  iam_instance_profile   = aws_iam_instance_profile.jenkins_profile.name
+  iam_instance_profile   = aws_iam_instance_profile.jenkins_mgmt_profile.name
   user_data              = local.devops_setup
   tags                   = { Name = "Jenkins-Agent-0${count.index + 1}-Private" }
 }
@@ -261,16 +182,18 @@ resource "aws_instance" "monitoring_stack" {
   ami                    = "ami-0c842822bfbc83b45"
   instance_type          = "t3.small"
   subnet_id              = aws_subnet.private.id
-  vpc_security_group_ids = [aws_security_group.internal_sg_new.id]
+  vpc_security_group_ids = [aws_security_group.internal_sg.id]
   key_name               = "promethius-grafana-keypair"
-  iam_instance_profile   = aws_iam_instance_profile.monitoring_profile.name
-  user_data              = local.grafana_setup
+  iam_instance_profile   = aws_iam_instance_profile.jenkins_mgmt_profile.name
+  user_data              = local.devops_setup
   tags                   = { Name = "Monitoring-Stack-Private" }
+ 
 }
-
+ 
 # ==========================================
-# 6. VPC PEERING
+# 6. VPC PEERING (MANAGEMENT AS REQUESTER)
 # ==========================================
+# Find the Chatbot VPC
 data "aws_vpc" "chatbot_vpc" {
   filter {
     name   = "tag:Name"
@@ -278,21 +201,45 @@ data "aws_vpc" "chatbot_vpc" {
   }
 }
 
+# Create the Peering Connection
 resource "aws_vpc_peering_connection" "mgmt_to_chatbot" {
   vpc_id      = aws_vpc.devops_vpc.id
   peer_vpc_id = data.aws_vpc.chatbot_vpc.id
-  auto_accept = true 
-  tags        = { Name = "Mgmt-to-Chatbot-Peering" }
+  auto_accept = true # Auto-accept works because both VPCs are in the same account/region
+  
+  tags = { Name = "Mgmt-to-Chatbot-Peering" }
 }
 
+# Add Route: Mgmt Private -> Chatbot VPC
 resource "aws_route" "mgmt_private_to_chatbot" {
   route_table_id            = aws_route_table.private_rt.id
   destination_cidr_block    = data.aws_vpc.chatbot_vpc.cidr_block
   vpc_peering_connection_id = aws_vpc_peering_connection.mgmt_to_chatbot.id
 }
 
+# Add Route: Mgmt Public -> Chatbot VPC
 resource "aws_route" "mgmt_public_to_chatbot" {
   route_table_id            = aws_route_table.public_rt.id
   destination_cidr_block    = data.aws_vpc.chatbot_vpc.cidr_block
+  vpc_peering_connection_id = aws_vpc_peering_connection.mgmt_to_chatbot.id
+}
+
+# ==========================================
+# 7. CHATBOT VPC RETURN ROUTING
+# ==========================================
+
+# Find the specific private route table in the Chatbot VPC
+data "aws_route_table" "chatbot_private_rt" {
+  vpc_id = data.aws_vpc.chatbot_vpc.id
+  filter {
+    name   = "tag:Name"
+    values = ["chatbot-production-vpc-private"]
+  }
+}
+
+# Inject the return route back to the Management VPC
+resource "aws_route" "chatbot_to_mgmt_return" {
+  route_table_id            = data.aws_route_table.chatbot_private_rt.id
+  destination_cidr_block    = aws_vpc.devops_vpc.cidr_block # 10.0.0.0/16
   vpc_peering_connection_id = aws_vpc_peering_connection.mgmt_to_chatbot.id
 }
